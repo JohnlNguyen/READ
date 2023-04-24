@@ -1,35 +1,26 @@
-# Standard library imports
-from tqdm import tqdm
-from torchmetrics.metric import Metric
-
 import json
 import os
-from collections import defaultdict
-from typing import NamedTuple, Optional, Any
+from typing import Optional
 
 # Third-party imports
 import pandas as pd
 import pytorch_lightning as pl
+import submitit
 import torch
 import wandb
-from pytorch_lightning.callbacks import (ModelCheckpoint, TQDMProgressBar,
-                                         EarlyStopping)
+from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint, TQDMProgressBar
 from pytorch_lightning.loggers import WandbLogger
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
 from torchvision.datasets import CocoCaptions
-from transformers import (
-    AutoTokenizer,
-    VisionEncoderDecoderModel,
-    ViTImageProcessor,
-)
-import submitit
+
+# Standard library imports
+from tqdm import tqdm
+from transformers import AutoTokenizer, VisionEncoderDecoderModel, ViTImageProcessor
 
 # Local application/library specific imports
 from adapter_utils import *
 from utils import *
-import random
-import numpy as np
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
@@ -145,16 +136,11 @@ class ImageCaptioningModel(pl.LightningModule):
         data_module,
         peft_conf,
         learning_rate=1e-4,
-        max_length=25,
-        model=None,
     ):
         super().__init__()
         self.tokenizer = AutoTokenizer.from_pretrained(text_model_name_or_path)
-        if model is None:
-            self.model = VisionEncoderDecoderModel.from_encoder_decoder_pretrained(
-                vision_model_name_or_path, text_model_name_or_path)
-        else:
-            self.model = model
+        self.model = VisionEncoderDecoderModel.from_encoder_decoder_pretrained(
+            vision_model_name_or_path, text_model_name_or_path)
 
         freeze(self.model.encoder)
         self.peft_conf = peft_conf
@@ -166,8 +152,6 @@ class ImageCaptioningModel(pl.LightningModule):
         self.data_module.setup()
 
         self.learning_rate = learning_rate
-        self.max_length = max_length
-
         self.val_loss = AvgMetric()
         self.test_loss = AvgMetric()
 
@@ -202,7 +186,7 @@ class ImageCaptioningModel(pl.LightningModule):
 
     def validation_step(self, batch, batch_idx):
         images = batch["pixel_values"].to(self.device)
-        captions = batch['captions']
+        captions = batch["captions"]
         labels = self.pad_text(captions).to(self.device)
         output = self.model(pixel_values=images, labels=labels)
         if batch_idx == 0:
@@ -213,7 +197,7 @@ class ImageCaptioningModel(pl.LightningModule):
 
     def test_step(self, batch, batch_idx):
         images = batch["pixel_values"].to(self.device)
-        captions = batch['captions']
+        captions = batch["captions"]
         labels = self.pad_text(captions).to(self.device)
         output = self.model(pixel_values=images, labels=labels)
         if batch_idx == 0:
@@ -238,7 +222,7 @@ class ImageCaptioningModel(pl.LightningModule):
             self.model.eval()
             self.model.to(device)
             for batch in tqdm(self.data_module.test_dataloader()):
-                images, image_ids = batch['pixel_values'], batch['image_id']
+                images, image_ids = batch["pixel_values"], batch["image_id"]
                 images = images.to(device)
 
                 generated_ids = self.model.generate(images)
@@ -255,19 +239,22 @@ class ImageCaptioningModel(pl.LightningModule):
 def sweep_iteration(config=None):
     print("Starting sweep iteration")
     seed_everything(1)
-    torch.set_float32_matmul_precision('high')
+    torch.set_float32_matmul_precision("high")
 
     with wandb.init():
         config = wandb.config if config is None else config
         print(config)
 
-        peft_confg = create_config(args.ft_type,
-                                   args.hidden_dim,
-                                   scaling_factor=config.scale_factor
-                                   if args.ft_type == "rnn" else 1.,
-                                   bidirectional=args.bidirectional,
-                                   r=args.bottle_neck_ratio,
-                                   alpha=args.alpha)
+        peft_confg = create_config(
+            args.ft_type,
+            args.hidden_dim,
+            prefix_length=10,
+            scaling_factor=config.scale_factor
+            if args.ft_type == "rnn" else 1.0,
+            bidirectional=args.bidirectional,
+            r=args.bottle_neck_ratio,
+            alpha=args.alpha,
+        )
         name = peft_confg.ft_type
 
         wandb_logger = WandbLogger()
@@ -277,15 +264,17 @@ def sweep_iteration(config=None):
             vision_model_name_or_path="google/vit-base-patch16-224-in21k",
             split_file="/data/home/ngjhn/read/coco/dataset_coco.json",
             collate_fn=collate_fn,
-            train_batch_size=32,
-            val_batch_size=128)
+            train_batch_size=8,
+            val_batch_size=128,
+        )
 
         model = ImageCaptioningModel(
             vision_model_name_or_path="google/vit-base-patch16-224-in21k",
-            text_model_name_or_path="bert-base-uncased",
+            text_model_name_or_path="bert-large-uncased",
             data_module=data_module,
             learning_rate=config.learning_rate,
-            peft_conf=peft_confg)
+            peft_conf=peft_confg,
+        )
 
         trainer = pl.Trainer(
             max_epochs=40,
@@ -295,27 +284,29 @@ def sweep_iteration(config=None):
                     monitor="val_loss",
                     mode="min",
                     filename=
-                    '{name}-lr:{config.learning_rate:.4f}-{epoch}-{val_loss:.2f}',
-                    dirpath=f'/data/home/ngjhn/read/lightning_logs/{name}',
-                    auto_insert_metric_name=True),
+                    "{name}-lr:{config.learning_rate:.4f}-{epoch}-{val_loss:.2f}",
+                    dirpath=f"/data/home/ngjhn/read/lightning_logs/{name}",
+                    auto_insert_metric_name=True,
+                ),
                 EarlyStopping(monitor="val_loss",
                               min_delta=0.00,
                               patience=3,
                               verbose=True),
-                TQDMProgressBar()
+                TQDMProgressBar(),
             ],
             default_root_dir="/data/home/ngjhn/read",
             logger=wandb_logger,
             num_sanity_val_steps=0,
-            check_val_every_n_epoch=2)
+            check_val_every_n_epoch=2,
+        )
 
         trainer.fit(model, data_module)
         return model
 
 
 def sweep(sweep_config):
-    sweep_id = wandb.sweep(
-        sweep_config, project='read') if not args.sweep_id else args.sweep_id
+    sweep_id = (wandb.sweep(sweep_config, project="read")
+                if not args.sweep_id else args.sweep_id)
     wandb.agent(sweep_id, project="read", function=sweep_iteration, count=10)
 
 
@@ -328,7 +319,7 @@ if __name__ == "__main__":
     executor = submitit.AutoExecutor(folder=args.slurm_folder)
     executor.update_parameters(
         name=f"{args.name}",
-        slurm_partition='lowpri',
+        slurm_partition="lowpri",
         nodes=nodes,
         tasks_per_node=1,
         slurm_gpus_per_task=1,
@@ -348,16 +339,26 @@ if __name__ == "__main__":
                 "min_iter": 3
             },
             "parameters": {
+                # "learning_rate": {
+                #     "min": 1e-4,
+                #     "max": 1e-3
+                # }
                 "learning_rate": {
-                    "min": 1e-4,
-                    "max": 1e-3
+                    "values": [
+                        0.0000854010639,
+                        0.0008540106397,
+                        0.0009927153629,
+                        0.0004784757354,
+                        0.0006663023945,
+                        0.0005272516063,
+                    ]
                 }
             },
         }
         if args.ft_type == "rnn":
-            sweep_config['parameters']['scale_factor'] = {
+            sweep_config["parameters"]["scale_factor"] = {
                 "min": 0.01,
-                "max": 2.0
+                "max": 1.0
             }
 
         with executor.batch():
@@ -370,5 +371,6 @@ if __name__ == "__main__":
         with executor.batch():
             job = executor.submit(
                 sweep_iteration,
-                Config(learning_rate=args.learning_rate, peft_conf=peft_confg))
+                Config(learning_rate=args.learning_rate, peft_conf=peft_confg),
+            )
         print(f"Submitted job {job.job_id} to SLURM queue")

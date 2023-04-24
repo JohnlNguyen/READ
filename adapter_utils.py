@@ -8,13 +8,14 @@
 from dataclasses import dataclass
 from functools import partial
 from typing import Iterable, List, Optional, Tuple, Union
-from transformers.adapters import LoRAConfig
+from transformers.adapters import LoRAConfig, PrefixTuningConfig
 import hydra
 
 import torch
 from hydra.core.config_store import ConfigStore
 from omegaconf import MISSING
 from torch import nn, Tensor
+from copy import deepcopy
 
 
 @dataclass
@@ -41,6 +42,7 @@ def get_class_name_str(klass) -> str:
 
 def create_config(ft_type,
                   hidden_dim,
+                  prefix_length=10,
                   scaling_factor=1.0,
                   bidirectional=False,
                   r=8,
@@ -55,12 +57,11 @@ def create_config(ft_type,
         peft_confg = AdapterConf(
             input_dim=768,
             hidden_dim=hidden_dim,
-            output_dim=768,
         )
     elif ft_type == "rnn":
         peft_confg = RNNAdapterConf(
             outputs_scaling_factor=scaling_factor,
-            input_dim=768,
+            input_dim=1024,
             rnn_dim=hidden_dim,
             num_layers=1,
             rnn_type="gru",
@@ -68,6 +69,8 @@ def create_config(ft_type,
         )
     elif ft_type == "lora":
         peft_confg = LoRAConf(r=r, alpha=alpha)
+    elif ft_type == "prefix":
+        peft_confg = PrefixTuningConf(prefix_length=prefix_length)
     else:
         raise Exception(f"Unknown ft_type {ft_type}")
     return peft_confg
@@ -89,7 +92,6 @@ def enable_full_tuning(model, num_orig_params):
 
 
 def enable_partial_tuning(model, num_orig_params, ft_key):
-    print(ft_key)
     p_num = 0
     for n, p in model.named_parameters():
         if ft_key in n:
@@ -110,15 +112,11 @@ def enable_adapter_tuning(model, num_orig_params, peft_conf):
         layers=model.encoder.encoder.layer,
         adapter_conf=peft_conf,
         std=None,
-        register_hooks=True,
     )
-    decoder_adapters = adapter_init(
-        model=model.decoder,
-        layers=model.decoder.bert.encoder.layer,
-        adapter_conf=peft_conf,
-        std=None,
-        register_hooks=True,
-    )
+    decoder_adapters = adapter_init(model=model.decoder,
+                                    layers=model.decoder.bert.encoder.layer,
+                                    adapter_conf=peft_conf,
+                                    std=None)
     encoder_p_num = sum(p.numel() for adapter in encoder_adapters
                         for p in adapter.parameters())
     decoder_p_num = sum(p.numel() for adapter in decoder_adapters
@@ -132,22 +130,23 @@ def enable_adapter_tuning(model, num_orig_params, peft_conf):
 
 def enable_rnn_adapter_tuning(model, num_orig_params, peft_conf):
     freeze(model)
-
+    encoder_conf = deepcopy(peft_conf)
+    encoder_conf.input_dim = 768
     encoder_rnn_adapter = rnn_adapter_init(
         model=model.encoder,
         layers=model.encoder.encoder.layer,
         merge_module=model.encoder.layernorm,
-        rnn_adapter_conf=peft_conf,
+        rnn_adapter_conf=encoder_conf,
     )
     decoder_rnn_adapter = rnn_adapter_init(
         model=model.decoder,
         layers=model.decoder.bert.encoder.layer,
-        merge_module=model.decoder.bert.encoder.layer[11].output.LayerNorm,
+        merge_module=model.decoder.bert.encoder.layer[-1].output.LayerNorm,
         rnn_adapter_conf=peft_conf,
     )
     encoder_p_num = sum(p.numel() for p in encoder_rnn_adapter.parameters())
     decoder_p_num = sum(p.numel() for p in decoder_rnn_adapter.parameters())
-    p_num = encoder_p_num + decoder_p_num
+    p_num = decoder_p_num + encoder_p_num
     ratio = round(p_num / num_orig_params, 3)
     print(
         f"Enables rnn-adapter tuning; num trainable params {p_num:,}, ratio {ratio}"
@@ -157,11 +156,32 @@ def enable_rnn_adapter_tuning(model, num_orig_params, peft_conf):
 def enable_lora_tuning(model, num_orig_params, peft_conf):
     freeze(model)
     config = LoRAConfig(r=peft_conf.r, alpha=peft_conf.alpha)
+    model.encoder.add_adapter("lora", config=config, set_active=True)
     model.decoder.add_adapter("lora", config=config, set_active=True)
     p_num = count_parameters(model)
     ratio = round(p_num / num_orig_params, 3)
     print(
         f"Enables lora tuning; num trainable params {p_num:,}, ratio:{ratio}")
+
+
+def enable_prefix_tuning(model, num_orig_params, peft_conf):
+    freeze(model)
+    config = PrefixTuningConfig(flat=False,
+                                prefix_length=peft_conf.prefix_length)
+    model.encoder.add_adapter("prefix", config=config, set_active=True)
+    model.decoder.add_adapter("prefix", config=config, set_active=True)
+    p_num = count_parameters(model)
+    ratio = round(p_num / num_orig_params, 3)
+    print(
+        f"Enables prefix tuning; num trainable params {p_num:,}, ratio:{ratio}"
+    )
+
+
+@dataclass
+class PrefixTuningConf(FTConf):
+    _target_: str = get_class_name_str(PrefixTuningConfig)
+    ft_type: str = "prefix"
+    prefix_length: int = 10
 
 
 @dataclass
@@ -186,6 +206,8 @@ def setup_ft(model, peft_conf):
         enable_partial_tuning(model, num_orig_params, peft_conf.ft_key)
     elif peft_conf.ft_type == "lora":
         enable_lora_tuning(model, num_orig_params, peft_conf)
+    elif peft_conf.ft_type == "prefix":
+        enable_prefix_tuning(model, num_orig_params, peft_conf)
     else:
         raise ValueError(f"Unsupported FT type {peft_conf.ft_type}")
 
@@ -320,8 +342,8 @@ class RNNAdapter(nn.Module):
             bidirectional=bidirectional,
             batch_first=True,
         )
-        self.output_projection = nn.Linear(rnn_dim * 2 if bidirectional else 1,
-                                           input_dim)
+        self.output_projection = nn.Linear(
+            rnn_dim * 2 if bidirectional else rnn_dim, input_dim)
 
         self._cached_states: List[Tensor] = []
 
